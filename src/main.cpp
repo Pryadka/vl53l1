@@ -1,66 +1,223 @@
 #include <Wire.h>
 #include <VL53L1X.h>
 
+template <typename... T>
+void log(const char *fmt, T&&... args)
+{
+  Serial.printf(fmt, args...);
+  Serial.println();
+}
 
-const uint8_t sensorCount = 1;
+struct SensorData {
+  VL53L1X sensor;
+  uint8_t xshutPin {};
+  uint8_t interruptPin {};
+  void (*interruptHandler)() {};
+  volatile bool dataReady {};
 
-// The Arduino pin connected to the XSHUT pin of each sensor.
-const uint8_t xshutPins[sensorCount] = {33};
+  // For detection
+  std::array<uint16_t, 3> recentReadings {};
+  uint8_t readingIndex {};
+  uint16_t currentDistance {};
+  uint32_t lastValidReading {};
+  bool hasValidReading {};
+};
 
-VL53L1X sensors[sensorCount];
+void gpio0_isr();
+void gpio1_isr();
+void gpio2_isr();
+void gpio3_isr();
+
+SensorData sensorsData[] = {
+  {
+    {},
+    33, // XSHUT pin
+    2,  // interrupt pin
+    gpio0_isr // interrupt handler
+  },
+};
+
+// We can't do any calculations or whatever in interrupt handlers.
+void gpio0_isr() { sensorsData[0].dataReady = true; }
+// void gpio1_isr() { sensorsData[1].dataReady = true; }
+// void gpio2_isr() { sensorsData[2].dataReady = true; }
+// void gpio3_isr() { sensorsData[3].dataReady = true; }
+
+struct DetectionCandidate
+{
+  uint16_t distance {};
+  uint32_t firstSeen {};
+  uint8_t confirmedSensors {};
+  bool active {};
+};
+
+// Just some bullshit for a playground.
+const uint16_t MAX_DETECTION_RANGE = 4000;
+const uint16_t MIN_DETECTION_RANGE = 10;
+const uint16_t NOISE_THRESHOLD = 10;
+const uint16_t DETECTION_WINDOW_MS = 100;
+const uint16_t MAX_READING_AGE_MS = 60;
+const uint16_t ALERT_COOLDOWN_MS = 20;
+const uint16_t MIN_CONFIRMING_SENSORS = (std::size(sensorsData) + 1) / 2;
+
+DetectionCandidate currentCandidate;
+uint16_t lastDetectionAlert = 0;
+
+// Median shit
+uint16_t getFilteredReading(const SensorData &s)
+{
+  auto readings = s.recentReadings;
+  std::sort(std::begin(readings), std::end(readings));
+  return readings[readings.size() / 2];
+}
+
+bool isValidTarget(uint16_t distance)
+{
+  return (distance >= MIN_DETECTION_RANGE && distance <= MAX_DETECTION_RANGE);
+}
+
+void updateDetection(uint32_t currentTime)
+{
+  uint8_t sensorsWithTargets = 0;
+  uint16_t averageDistance = 0;
+  uint32_t distanceSum = 0;
+
+  // Count how many sensors currently see valid targets
+  for (size_t i = 0; i < std::size(sensorsData); ++i)
+  {
+    if (sensorsData[i].hasValidReading &&
+        (currentTime - sensorsData[i].lastValidReading) < MAX_READING_AGE_MS &&
+        isValidTarget(sensorsData[i].currentDistance))
+    {
+      ++sensorsWithTargets;
+      distanceSum += sensorsData[i].currentDistance;
+    }
+  }
+
+  if (sensorsWithTargets >= MIN_CONFIRMING_SENSORS)
+  {
+    averageDistance = distanceSum / sensorsWithTargets;
+
+    if (!currentCandidate.active)
+    {
+      // New detection candidate
+      currentCandidate.distance = averageDistance;
+      currentCandidate.firstSeen = currentTime;
+      currentCandidate.confirmedSensors = sensorsWithTargets;
+      currentCandidate.active = true;
+    }
+    else
+    {
+      // Update existing candidate
+      currentCandidate.distance = (currentCandidate.distance + averageDistance) / 2;
+      currentCandidate.confirmedSensors = std::max(currentCandidate.confirmedSensors, sensorsWithTargets);
+    }
+  }
+  else
+  {
+    // Reset candidate if not enough confirming sensors
+    if (currentCandidate.active && (currentTime - currentCandidate.firstSeen) > DETECTION_WINDOW_MS)
+    {
+      currentCandidate.active = false;
+    }
+  }
+
+  if (currentCandidate.active &&
+    currentCandidate.confirmedSensors >= MIN_CONFIRMING_SENSORS &&
+    (currentTime - lastDetectionAlert) > ALERT_COOLDOWN_MS)
+  {
+
+    log("Some shit detected. Distance: %u mm, Confirmed by %d/%d sensors,",
+        currentCandidate.distance,
+        currentCandidate.confirmedSensors,
+        std::size(sensorsData));
+
+    lastDetectionAlert = currentTime;
+
+    // digitalWrite(BLOW_THE_SHIT_PIN, HIGH);
+  }
+}
 
 void setup()
 {
   Serial.begin(115200);
-
   Serial.println("Start");
+
   Wire.begin();
   Wire.setClock(400000); // use 400 kHz I2C
 
-  for (uint8_t i = 0; i < sensorCount; i++)
+  for (auto &sd : sensorsData)
   {
-    pinMode(xshutPins[i], OUTPUT);
-    digitalWrite(xshutPins[i], LOW);
+    pinMode(sd.xshutPin, OUTPUT);
+    digitalWrite(sd.xshutPin, LOW);
   }
 
   // Enable, initialize, and start each sensor, one by one.
-  for (uint8_t i = 0; i < sensorCount; i++)
+  for (size_t i = 0; i < std::size(sensorsData); ++i)
   {
+    auto &sd = sensorsData[i];
     // Stop driving this sensor's XSHUT low. This should allow the carrier
     // board to pull it high. (We do NOT want to drive XSHUT high since it is
     // not level shifted.) Then wait a bit for the sensor to start up.
-    pinMode(xshutPins[i], INPUT);
+    pinMode(sd.xshutPin, INPUT);
     delay(10);
 
-    sensors[i].setTimeout(500);
-    int res = sensors[i].init();
-    if (res != 0)
+    sd.sensor.setTimeout(500);
+    
+    if (!sd.sensor.init())
     {
-      Serial.print("Failed to detect and initialize sensor. res=");Serial.println(res, HEX);
-      Serial.println(i);
-      while (1);
+      log("Failed to detect and initialize sensor %d", i);
+      while (1); // Why?
     }
+
+    pinMode(sd.interruptPin, INPUT_PULLUP);
+    attachInterrupt(digitalPinToInterrupt(sd.interruptPin), sd.interruptHandler, FALLING);
 
     // Each sensor must have its address changed to a unique value other than
     // the default of 0x29 (except for the last one, which could be left at
     // the default). To make it simple, we'll just count up from 0x2A.
-    sensors[i].setAddress(0x2A + i);
+    sd.sensor.setAddress(0x2A + i);
 
-    sensors[i].startContinuous(2);
+    // How will this impact the measurements?
+    sd.sensor.setDistanceMode(VL53L1X::DistanceMode::Long);
+
+    // The minimum and maximum timing budgets are [20ms, 1000ms], according to sensor spec
+    sd.sensor.setMeasurementTimingBudget(20*1000); // <- microseconds
+    // The minimum inter-measurement period is 20ms, according to sensor spec
+    sd.sensor.startContinuous(20);
   }
 }
 
 void loop()
 {
-  for (uint8_t i = 0; i < sensorCount; i++)
+  const uint32_t now = ::millis();
+
+  for (size_t i = 0; i < std::size(sensorsData); ++i)
   {
-    const auto distance = sensors[i].read();
-    if (sensors[i].timeoutOccurred()) { 
-      Serial.println("TIMEOUT"); 
+    auto &sd = sensorsData[i];
+    if (!sd.dataReady) continue;
+    sd.dataReady = false;
+
+    // Is it really beneficial to have interrupt check + non-blocking read?
+    // I mean, it seems to be there is a lot of garbage data to filter out in this case.
+    sd.sensor.read(false);
+    if (sd.sensor.timeoutOccurred())
+    {
+      // Most likely sensor is dead. How to hard-reset it?
+      log("Sensor %d timeout", i);
+      continue;
     }
-    if (distance < 500) {
-      Serial.print("BUH=");Serial.print(i);
-      Serial.print(" Distance: ");Serial.print(distance);Serial.println(" mm");
-    }
+
+    const auto &rangingData = sd.sensor.ranging_data;
+    if (rangingData.range_status != VL53L1X::RangeStatus::RangeValid) continue;
+
+    sd.recentReadings[sd.readingIndex] = rangingData.range_mm;
+    sd.readingIndex = (sd.readingIndex + 1) % sd.recentReadings.size();
+
+    sd.currentDistance = getFilteredReading(sd);
+    sd.lastValidReading = now;
+    sd.hasValidReading = true;
   }
+
+  updateDetection(now);
 }
