@@ -8,7 +8,9 @@
         "/opt/ros/humble/local/lib/python3.10/dist-packages"
     ],
     "files.associations": {
-        "*.tcc": "cpp"
+        "*.tcc": "cpp",
+        "*.tpp": "cpp",
+        "cmath": "cpp"
     },
     "ros.distro": "humble"
 }
